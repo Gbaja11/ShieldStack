@@ -169,3 +169,158 @@
         (ok true)
     )
 )
+
+;; purchase-advanced-policy to handle calculate-premiums response
+(define-public (purchase-advanced-policy (tier uint) (coverage uint) (stake-amount uint) (duration uint))
+    (let (
+        (risk-score (calculate-risk-score tx-sender))
+        (premium-amount (unwrap! (calculate-premiums tier coverage risk-score) ERR-INVALID-PARAMETERS))
+        (start-block block-height)
+        (end-block (+ block-height duration))
+        (tier-info (unwrap! (map-get? policy-tiers tier) ERR-INVALID-PARAMETERS))
+    )
+    (asserts! (<= risk-score RISK-THRESHOLD) ERR-RISK-SCORE-HIGH)
+    (asserts! (>= stake-amount (get min-stake tier-info)) ERR-STAKE-TOO-LOW)
+    (asserts! (<= coverage (* coverage (get coverage-multiplier tier-info))) ERR-MAX-COVERAGE-EXCEEDED)
+
+    ;; Transfer premium and stake
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+
+    ;; Update pools
+    (var-set reserve-pool (+ (var-get reserve-pool) premium-amount))
+    (var-set stake-pool (+ (var-get stake-pool) stake-amount))
+
+    ;; Create policy
+    (ok (map-set insurance-policies tx-sender {
+        tier: tier,
+        premium-paid: premium-amount,
+        coverage-limit: coverage,
+        stake-amount: stake-amount,
+        start-block: start-block,
+        expiry-block: end-block,
+        risk-score: risk-score,
+        claims-made: u0,
+        status: "ACTIVE",
+        last-claim-block: u0
+    })))
+)
+
+(define-public (submit-enhanced-claim 
+    (amount uint) 
+    (evidence-hash (buff 32))
+    (category (string-ascii 30)))
+    (let (
+        (policy (unwrap! (map-get? insurance-policies tx-sender) ERR-NO-POLICY-EXISTS))
+        (claim-id (get claims-made policy))
+    )
+    ;; Validate claim
+    (asserts! (verify-policy-active tx-sender) ERR-POLICY-TERMINATED)
+    (asserts! (<= amount (get coverage-limit policy)) ERR-INVALID-PARAMETERS)
+    (asserts! (> (- block-height (get last-claim-block policy)) CLAIM-COOLDOWN-PERIOD) ERR-COOLDOWN-ACTIVE)
+
+    ;; Create claim
+    (map-set insurance-claims 
+        {policyholder: tx-sender, claim-id: claim-id}
+        {
+            amount-requested: amount,
+            evidence-hash: evidence-hash,
+            timestamp: block-height,
+            assessor: (var-get protocol-owner),
+            verdict: "PENDING",
+            payout-amount: u0,
+            category: category
+        })
+
+    ;; Update policy
+    (ok (map-set insurance-policies tx-sender 
+        (merge policy {
+            claims-made: (+ claim-id u1),
+            last-claim-block: block-height
+        })))
+))
+
+(define-public (process-claim (policyholder principal) (claim-id uint) (verdict (string-ascii 20)) (payout uint))
+    (let (
+        (claim (unwrap! (map-get? insurance-claims {policyholder: policyholder, claim-id: claim-id}) ERR-INVALID-CLAIM-DATA))
+        (policy (unwrap! (map-get? insurance-policies policyholder) ERR-NO-POLICY-EXISTS))
+    )
+    (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR-UNAUTHORIZED)
+
+    ;; Process payout if approved
+    (if (is-eq verdict "APPROVED")
+        (begin
+            (try! (as-contract (stx-transfer? payout (as-contract tx-sender) policyholder)))
+            (var-set reserve-pool (- (var-get reserve-pool) payout))
+        )
+        true
+    )
+
+    ;; Update claim
+    (ok (map-set insurance-claims 
+        {policyholder: policyholder, claim-id: claim-id}
+        (merge claim {
+            verdict: verdict,
+            payout-amount: payout
+        })))
+))
+
+(define-public (stake-tokens (amount uint))
+    (let (
+        (current-stake (default-to {amount: u0, rewards: u0, lock-period: u0, last-reward-block: block-height} 
+            (map-get? staker-info tx-sender)))
+    )
+    (asserts! (>= amount MIN-STAKE-AMOUNT) ERR-STAKE-TOO-LOW)
+
+    ;; Transfer stake
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; staking info
+    (ok (map-set staker-info tx-sender
+        {
+            amount: (+ (get amount current-stake) amount),
+            rewards: (get rewards current-stake),
+            lock-period: (+ block-height u2160), ;; 15 days
+            last-reward-block: block-height
+        }))
+))
+
+(define-public (claim-staking-rewards)
+    (let (
+        (staker (unwrap! (map-get? staker-info tx-sender) ERR-UNAUTHORIZED))
+        (blocks-elapsed (- block-height (get last-reward-block staker)))
+        (reward-rate u100) ;; 1% per 1000 blocks
+        (rewards-earned (/ (* (* blocks-elapsed (get amount staker)) reward-rate) u100000))
+    )
+    (asserts! (>= block-height (get lock-period staker)) ERR-COOLDOWN-ACTIVE)
+
+    ;; Transfer rewards
+    (try! (as-contract (stx-transfer? rewards-earned (as-contract tx-sender) tx-sender)))
+
+    ;; staking info
+    (ok (map-set staker-info tx-sender
+        (merge staker {
+            rewards: u0,
+            last-reward-block: block-height
+        })))
+))
+
+;; Administrative functions
+(define-public (update-protocol-parameters 
+    (new-base-premium uint)
+    (new-claim-ceiling uint)
+    (new-risk-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR-UNAUTHORIZED)
+        (var-set base-premium new-base-premium)
+        (var-set claim-ceiling new-claim-ceiling)
+        (ok true)
+    )
+)
+
+(define-public (transfer-ownership (new-owner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get protocol-owner)) ERR-UNAUTHORIZED)
+        (ok (var-set protocol-owner new-owner))
+    )
+)
